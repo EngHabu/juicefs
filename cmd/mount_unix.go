@@ -210,6 +210,21 @@ func readThreadStats(pid int, tid string, b *strings.Builder) {
 }
 
 func watchdog(ctx context.Context, mp string) {
+	if csiCommPath != "" {
+		// Broker-adopted channel: the broker keeps this superblock's fd open so
+		// a crashed client can be resumed, which means a stat on the
+		// mountpoint from here is only ever answered while the child serves.
+		// With the child gone it blocks in D state, uninterruptibly -- and a
+		// supervisor pinned that way can neither restart the child, reap it,
+		// nor exit. On 2026-09-10 a teardown SIGTERM landed while this probe
+		// was waiting on a slow child; the child exited, the probe never
+		// returned, and the workspace's home volume stayed frozen until the
+		// pod was deleted. The plugin probes liveness from outside the daemon,
+		// so nothing here needs to touch the mount.
+		logger.Infof("watchdog: %q is a broker-adopted channel; not probing the mountpoint from the supervisor", mp)
+		<-ctx.Done()
+		return
+	}
 	var lastActive int64 = time.Now().Unix()
 	var pid int
 	var agentAddr string
@@ -1076,30 +1091,47 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 
 		notInCSI := os.Getenv("JFS_SUPER_COMM") == ""
 		signalChan := make(chan os.Signal, 10)
+		// Termination is forwarded to the child in every mode. Until now an
+		// adopted-channel supervisor installed no handler at all, so SIGTERM
+		// took the default action and killed it mid-syscall -- on 2026-09-10
+		// with a thread parked in a stat on the mount, which left an
+		// unkillable, unreapable husk holding the FUSE session. SIGHUP is the
+		// graceful-upgrade handshake and is still relayed only outside CSI.
+		var shuttingDown int32
 		if notInCSI {
 			signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-			go func() {
-				for {
-					sig := <-signalChan
-					if sig == nil {
-						return
-					}
-					logger.Infof("received signal %s, propagating to child process %d...", sig.String(), mountPid)
-					if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
-						logger.Errorf("send signal %s to %d: %s", sig.String(), mountPid, err)
-					}
-				}
-			}()
+		} else {
+			signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
 		}
+		go func() {
+			for {
+				sig := <-signalChan
+				if sig == nil {
+					return
+				}
+				if sig != syscall.SIGHUP {
+					atomic.StoreInt32(&shuttingDown, 1)
+				}
+				logger.Infof("received signal %s, propagating to child process %d...", sig.String(), mountPid)
+				if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					logger.Errorf("send signal %s to %d: %s", sig.String(), mountPid, err)
+				}
+			}
+		}()
 
 		ctx, cancel := context.WithCancel(context.TODO())
 		go watchdog(ctx, mp)
 		err = cmd.Wait()
 		cancel()
-		if notInCSI {
-			signal.Stop(signalChan)
-		}
+		signal.Stop(signalChan)
 		close(signalChan)
+		if !notInCSI && atomic.LoadInt32(&shuttingDown) == 1 {
+			// Asked to stop and the child has now exited (an adopted channel
+			// exits promptly on SIGTERM, #22). There is nothing to unmount from
+			// here -- the broker owns the mount -- and nothing to restart.
+			logger.Infof("mount process %d exited after a termination signal (%v); not restarting", mountPid, err)
+			return nil
+		}
 		if err == nil {
 			return nil
 		} else {
