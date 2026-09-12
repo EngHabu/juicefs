@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/zeebo/blake3"
@@ -104,14 +105,15 @@ type ptBacking struct {
 	path      string
 	f         *os.File
 	backingID int32
-}
-
-type ptFile struct {
-	ino Ino
-	fh  uint64
-	b   *ptBacking
-	// mu serializes staging-content copies for this open: fsync-time copies
-	// against each other and against the final release-time reconcile.
+	// refs counts the write-capable opens using this backing: the original
+	// passthrough writer plus any shared reopen with write access (see
+	// share). The reconcile that lands the data runs when the last of them
+	// releases; earlier releases only drop their reference. Guarded by
+	// passthroughState.mu.
+	refs int
+	// mu serializes staging-content copies for this backing: fsync-time
+	// copies against each other and against the final release-time
+	// reconcile, from whichever open issues them.
 	mu sync.Mutex
 	// synced is the fingerprint of the staging content the last fsync-time
 	// copy landed in JuiceFS, or nil if no fsync has copied yet. A later
@@ -121,6 +123,20 @@ type ptFile struct {
 	// changes the JuiceFS inode behind the staging's back must clear it (see
 	// truncate). Guarded by mu.
 	synced *ptSyncMark
+}
+
+type ptFile struct {
+	ino Ino
+	fh  uint64
+	b   *ptBacking
+	// writer is true for opens with write access: the original passthrough
+	// writer and shared reopens that can write. Only these hold a busy
+	// reference on the inode and a ref on the backing; a shared read-only
+	// open just reads the staging file the kernel already has open.
+	writer bool
+	// shared is true for an open that joined an existing writer's backing
+	// (see share) rather than checking out its own.
+	shared bool
 }
 
 // ptSyncMark fingerprints staging content that has been copied into JuiceFS.
@@ -157,20 +173,20 @@ func fingerprintStaging(path string) (*ptSyncMark, error) {
 // the fingerprint recorded by the last fsync-time copy. False when there is
 // no mark, when the size differs (cheap, checked first), or when the content
 // hash differs. Any error reads as "changed" so the caller falls back to the
-// full copy, which is always safe. Caller holds pf.mu.
+// full copy, which is always safe. Caller holds pf.b.mu.
 func (pf *ptFile) stagingUnchangedLocked() bool {
-	if pf.synced == nil {
+	if pf.b.synced == nil {
 		return false
 	}
 	st, err := os.Stat(pf.b.path)
-	if err != nil || uint64(st.Size()) != pf.synced.size {
+	if err != nil || uint64(st.Size()) != pf.b.synced.size {
 		return false
 	}
 	m, err := fingerprintStaging(pf.b.path)
 	if err != nil {
 		return false
 	}
-	return m.size == pf.synced.size && m.sum == pf.synced.sum
+	return m.size == pf.b.synced.size && m.sum == pf.b.synced.sum
 }
 
 func newPassthroughState(server *fuse.Server, dir string) *passthroughState {
@@ -390,9 +406,100 @@ func (p *passthroughState) tryOpen(ino Ino, fh uint64, flags uint32, emptyAtOpen
 		return 0, false
 	}
 	p.mu.Lock()
-	p.files[fh] = &ptFile{ino: ino, fh: fh, b: b}
+	b.refs = 1
+	p.files[fh] = &ptFile{ino: ino, fh: fh, b: b, writer: true}
 	p.mu.Unlock()
 	return b.backingID, true
+}
+
+// canShare reports whether ino currently has a live passthrough backing an
+// open could join (see share). Cheap and lock-scoped; the answer can change
+// before share runs, which is why share re-checks under the same lock.
+func (p *passthroughState) canShare(ino Ino) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.liveBackingLocked(ino) != nil
+}
+
+// liveBackingLocked returns the backing of any open on ino still in p.files,
+// i.e. one whose reconcile has not started (reconcile removes the entry
+// first). Caller holds p.mu.
+func (p *passthroughState) liveBackingLocked(ino Ino) *ptBacking {
+	for _, f := range p.files {
+		if f.ino == ino {
+			return f.b
+		}
+	}
+	return nil
+}
+
+// share joins a new open of ino onto the backing of a passthrough writer
+// that is still open, so the kernel serves the new fd from the same staging
+// file and both see the same bytes. This is what a reopen-while-writing
+// needs — git index-pack and uv both write a file and reopen it before
+// closing the writer — and it is what made those fail: waitInode cannot
+// end while the writer holds its fd, so every such reopen sat out the full
+// timeout and got EAGAIN (2026-09-04 → 09-12, every git fetch into a volume).
+//
+// A read-only share holds nothing: the kernel keeps its own reference to the
+// backing file, so reads keep working even after the writer's reconcile
+// retires the registration and unlinks the path. A write-capable share
+// counts as a writer — busy on the inode, a ref on the backing — so the
+// reconcile waits for it (its writes would otherwise land in a staging file
+// nobody copies again). Refused while draining for handover, when a new
+// writer could outlive the drain.
+func (p *passthroughState) share(ino Ino, fh uint64, flags uint32) (int32, bool) {
+	if p == nil {
+		return 0, false
+	}
+	writer := isWriteOpen(flags)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b := p.liveBackingLocked(ino)
+	if b == nil || (writer && p.paused) {
+		return 0, false
+	}
+	if writer {
+		p.busy[ino]++
+		b.refs++
+	}
+	p.files[fh] = &ptFile{ino: ino, fh: fh, b: b, writer: writer, shared: true}
+	return b.backingID, true
+}
+
+// fixupLength raises entry's length to the live staging size while a
+// passthrough backing is open for ino (see liveSize). Never lowers it.
+func (p *passthroughState) fixupLength(ino Ino, entry *meta.Entry) {
+	if p == nil || entry == nil || entry.Attr == nil {
+		return
+	}
+	if sz, ok := p.liveSize(ino); ok && sz > entry.Attr.Length {
+		entry.Attr.Length = sz
+	}
+}
+
+// liveSize returns the current size of ino's staging file while a
+// passthrough backing is live for it. Until reconcile lands, the metadata
+// still says 0 (or the pre-write size), which is what a stat would report
+// — wrong for anyone sizing a file they, or a sibling fd, just wrote.
+func (p *passthroughState) liveSize(ino Ino) (uint64, bool) {
+	if p == nil {
+		return 0, false
+	}
+	p.mu.Lock()
+	b := p.liveBackingLocked(ino)
+	p.mu.Unlock()
+	if b == nil {
+		return 0, false
+	}
+	st, err := b.f.Stat()
+	if err != nil {
+		return 0, false
+	}
+	return uint64(st.Size()), true
 }
 
 // releaseBusyLocked drops one busy reference for ino. Caller holds p.mu.
@@ -448,8 +555,23 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 	if pf != nil {
 		delete(p.files, fh)
 	}
+	last := false
+	if pf != nil && pf.writer {
+		pf.b.refs--
+		last = pf.b.refs == 0
+	}
 	p.mu.Unlock()
-	if pf == nil {
+	if pf == nil || !pf.writer {
+		// A shared read-only open: it borrowed the writer's backing and owns
+		// no data; the kernel drops its own reference to the staging file.
+		return
+	}
+	if !last {
+		// Another write-capable open still uses this backing; whichever
+		// releases last lands the data. Drop this open's busy reference.
+		p.mu.Lock()
+		p.releaseBusyLocked(pf.ino)
+		p.mu.Unlock()
 		return
 	}
 	// Free the inode for a new passthrough open only once its data has fully
@@ -498,15 +620,15 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 		}
 	}()
 
-	pf.mu.Lock()
-	defer pf.mu.Unlock()
+	pf.b.mu.Lock()
+	defer pf.b.mu.Unlock()
 	var off uint64
 	if pf.stagingUnchangedLocked() {
 		// An fsync already copied exactly this content into slices; a second
 		// full copy would re-upload the whole file (measured: every
 		// write-fsync-close paid 2x its size in object PUTs). Skip the copy;
 		// the flush below still lands anything the writer holds.
-		off = pf.synced.size
+		off = pf.b.synced.size
 		logger.Debugf("passthrough: ino %d staging unchanged since fsync, not recopying %d bytes", pf.ino, off)
 	} else {
 		var ok bool
@@ -540,7 +662,7 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 // overwrites of already-copied ranges. Also returns the blake3 fingerprint of
 // the bytes copied, so an fsync-time copy can record what is now in slices
 // and a later copy can be skipped if the staging has not changed since.
-// Caller holds pf.mu.
+// Caller holds pf.b.mu.
 func (p *passthroughState) copyStagingLocked(ctx vfs.Context, v *vfs.VFS, pf *ptFile) (uint64, [32]byte, bool) {
 	var sum [32]byte
 	rf, err := os.Open(pf.b.path)
@@ -610,8 +732,8 @@ func (p *passthroughState) fsync(ctx vfs.Context, v *vfs.VFS, fh uint64) (bool, 
 	if pf == nil {
 		return false, 0
 	}
-	pf.mu.Lock()
-	defer pf.mu.Unlock()
+	pf.b.mu.Lock()
+	defer pf.b.mu.Unlock()
 	// Fence: a checkpoint/commit racing this copy must wait for it, exactly
 	// as for a release-time reconcile, or it could snapshot a mid-copy state
 	// of a file the application believes it just made durable.
@@ -624,7 +746,7 @@ func (p *passthroughState) fsync(ctx vfs.Context, v *vfs.VFS, fh uint64) (bool, 
 			// the failure so the application does not trust this fsync.
 			return true, syscall.EIO
 		}
-		pf.synced = &ptSyncMark{size: off, sum: sum}
+		pf.b.synced = &ptSyncMark{size: off, sum: sum}
 	}
 	if e := v.Fsync(ctx, pf.ino, 0, fh); e != 0 {
 		return true, e
@@ -655,13 +777,13 @@ func (p *passthroughState) truncate(ino Ino, size uint64) {
 	if pf == nil {
 		return
 	}
-	pf.mu.Lock()
-	defer pf.mu.Unlock()
+	pf.b.mu.Lock()
+	defer pf.b.mu.Unlock()
 	// The JuiceFS inode just changed behind the staging's back: a later
 	// staging that happens to match the fsync-time fingerprint again (shrink,
 	// then rewrite the same tail) would otherwise skip a copy the truncated
 	// inode needs. Forget the mark so the next copy is a full one.
-	pf.synced = nil
+	pf.b.synced = nil
 	if err := pf.b.f.Truncate(int64(size)); err != nil {
 		logger.Errorf("passthrough: mirror truncate ino %d to %d on %s: %s", ino, size, pf.b.path, err)
 	}

@@ -47,7 +47,7 @@ func TestStagingUnchangedTracksContent(t *testing.T) {
 	if m.size != uint64(len(orig)) {
 		t.Fatalf("fingerprint size %d, want %d", m.size, len(orig))
 	}
-	pf := &ptFile{b: &ptBacking{path: path}, synced: m}
+	pf := &ptFile{b: &ptBacking{path: path, synced: m}}
 	if !pf.stagingUnchangedLocked() {
 		t.Fatalf("identical content must read as unchanged")
 	}
@@ -86,7 +86,7 @@ func TestStagingUnchangedEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pf := &ptFile{b: &ptBacking{path: path}, synced: m}
+	pf := &ptFile{b: &ptBacking{path: path, synced: m}}
 	if !pf.stagingUnchangedLocked() {
 		t.Fatalf("empty file with its own mark must read as unchanged")
 	}
@@ -110,10 +110,10 @@ func TestTruncateClearsSyncMark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pf := &ptFile{ino: Ino(9), fh: 3, b: &ptBacking{path: path, f: f}, synced: m}
+	pf := &ptFile{ino: Ino(9), fh: 3, b: &ptBacking{path: path, f: f, synced: m}, writer: true}
 	p := &passthroughState{dir: dir, files: map[uint64]*ptFile{3: pf}, busy: map[Ino]int{Ino(9): 1}}
 	p.truncate(Ino(9), 1024)
-	if pf.synced != nil {
+	if pf.b.synced != nil {
 		t.Fatalf("truncate must clear the sync mark")
 	}
 	if st, err := os.Stat(path); err != nil || st.Size() != 1024 {

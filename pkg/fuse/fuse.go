@@ -100,6 +100,7 @@ func (fs *fileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name
 		}
 		return fuse.Status(err)
 	}
+	fs.pt.fixupLength(entry.Inode, entry)
 	return fs.replyEntry(ctx, out, entry)
 }
 
@@ -114,6 +115,7 @@ func (fs *fileSystem) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *f
 	if err != 0 {
 		return fuse.Status(err)
 	}
+	fs.pt.fixupLength(Ino(in.NodeId), entry)
 	fs.replyAttr(ctx, entry, &out.Attr, out.SetTimeout)
 	return 0
 }
@@ -258,29 +260,52 @@ func (fs *fileSystem) Create(cancel <-chan struct{}, in *fuse.CreateIn, name str
 func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
-	// If this inode has a passthrough write still reconciling, wait for it so
+	ino := Ino(in.NodeId)
+	// A reopen while a passthrough writer is still open on this inode joins
+	// the writer's backing (share): the kernel serves it from the same
+	// staging file, so it sees every byte written so far. Waiting instead
+	// can never succeed — the writer's busy mark lasts as long as its fd —
+	// and used to fail every such reopen with EAGAIN after the full timeout.
+	shareable := fs.pt.canShare(ino)
+	// Otherwise, if a passthrough write is still reconciling, wait for it so
 	// this open sees the file's real (post-reconcile) size and content rather
 	// than the transient empty state — otherwise a write here would race the
 	// reconcile's copy and lose data. A timeout means the reconcile is
 	// abnormally slow (or stuck); proceeding anyway would silently serve
 	// stale/empty content as if it were authoritative, so fail the open
 	// instead of guessing — the caller can retry.
-	if !fs.pt.waitInode(Ino(in.NodeId), waitInodeTimeout) {
+	if !shareable && !fs.pt.waitInode(ino, waitInodeTimeout) {
 		return fuse.Status(syscall.EAGAIN)
 	}
-	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
+	entry, fh, err := fs.v.Open(ctx, ino, in.Flags)
 	if err != 0 {
 		return fuse.Status(err)
 	}
 	out.Fh = fh
-	// Passthrough only when this open observes an empty file: O_TRUNC (about
-	// to be emptied) or an already zero-length file. Otherwise the backing
-	// (which starts empty) would shadow / overwrite real content.
-	emptyAtOpen := in.Flags&uint32(syscall.O_TRUNC) != 0 || entry.Attr.Length == 0
-	if id, ok := fs.pt.tryOpen(Ino(in.NodeId), fh, in.Flags, emptyAtOpen); ok {
-		out.OpenFlags |= fuse.FOPEN_PASSTHROUGH
-		out.BackingID = id
-		return 0
+	if shareable {
+		if id, ok := fs.pt.share(ino, fh, in.Flags); ok {
+			out.OpenFlags |= fuse.FOPEN_PASSTHROUGH
+			out.BackingID = id
+			return 0
+		}
+		// The writer released between canShare and share, so its reconcile
+		// is now in flight: wait for it as above. The entry we hold predates
+		// the reconcile, so its size is not to be trusted — take the daemon
+		// path rather than let a stale zero length grant a fresh backing.
+		if !fs.pt.waitInode(ino, waitInodeTimeout) {
+			fs.v.Release(ctx, ino, fh)
+			return fuse.Status(syscall.EAGAIN)
+		}
+	} else {
+		// Passthrough only when this open observes an empty file: O_TRUNC
+		// (about to be emptied) or an already zero-length file. Otherwise the
+		// backing (which starts empty) would shadow / overwrite real content.
+		emptyAtOpen := in.Flags&uint32(syscall.O_TRUNC) != 0 || entry.Attr.Length == 0
+		if id, ok := fs.pt.tryOpen(ino, fh, in.Flags, emptyAtOpen); ok {
+			out.OpenFlags |= fuse.FOPEN_PASSTHROUGH
+			out.BackingID = id
+			return 0
+		}
 	}
 	if vfs.IsSpecialNode(Ino(in.NodeId)) {
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
